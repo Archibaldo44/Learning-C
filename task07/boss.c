@@ -4,84 +4,123 @@
 */
 #include <stdio.h>
 #include <stdlib.h>
-#include <time.h>       // time()
+#include <errno.h>      // errno
 #include <unistd.h>     // fork() read()
 #include <sys/wait.h>   // wait()
 #include <sys/types.h>  // open() fork() wait() umask()
 #include <sys/stat.h>   // open() umask()
 #include <fcntl.h>      // open() close()
 #include <string.h>     // memset()
-#define MIN_RANDOM 2
-#define MAX_RANDOM 7
-#define WORKER_NUMBER 5
-#define NAMEDPIPE_NAME "/tmp/my_named_pipe"
-#define BUFSIZE 80
+#include <signal.h>
+#include "globals.h"
 
-/* returns a string which is a random integer from range [min,max] */
-int get_random_range(void);
+/* prints error message and terminates the program */
+void error_exit(char*);
 
-int main(void)
+/* signal handler for Ctrl+C */
+void intHandler(int);
+
+int dummy_fifo = 0;
+int boss_fifo = 0;
+
+int main(int argc, char** argv)
 {
-    char rand_str[4] = { 0 };  // helper - to convert int to string
-    
-    srand((unsigned)time(0));
-    
-    /* create named pipe */
+    char buffer[BUFSIZE] = { 0 };
+	
+	// to catch Ctrl+C
+	struct sigaction act;
+    act.sa_handler = intHandler;
+    sigaction(SIGINT, &act, NULL);
+	
+	// creat boss FIFO file. if FIFO file already exits - delete it
+    unlink(BOSS_FIFO);
     umask(0);
-    if (mkfifo(NAMEDPIPE_NAME, 0777) == -1) {
-        perror("mkfifo");
-        exit(EXIT_FAILURE);
+    if (mkfifo(BOSS_FIFO, 0777) < 0) {
+        error_exit("mkfifo");
     }
-    
-    /* starting WORKER_NUMBER workers */
-    for (size_t i = 0; i < WORKER_NUMBER; i++) {
-        sprintf(rand_str, "%d", get_random_range());  // convert rand int to string
-        pid_t pid = fork(); 
-        switch (pid) {
-            case -1:
-                perror("fork");
-                break;
-            case 0:    // child
-                execl("worker", "", rand_str, NAMEDPIPE_NAME, NULL);
-            default:    // parent
-                break;
-        }
+    printf("BOSS: waiting for connections.\n");
+	
+    // open boss FIFO for reading
+    boss_fifo = open(BOSS_FIFO, O_RDONLY);
+    if (boss_fifo < 0) {
+        error_exit("Failed to open boss FIFO");
     }
-    printf("BOSS: working\n");
-    
-    /* open the named pipe for reading */
-    printf("BOSS: trying to open the named pipe\n");
-    int fd = open(NAMEDPIPE_NAME, O_RDONLY);
-    if (fd < 0) {
-        perror("open");
-        exit(EXIT_FAILURE);
+    printf("BOSS: FIFO is opened.\n");
+	
+	// open boss FIFO for writing to prevent EOF
+    dummy_fifo = open(BOSS_FIFO, O_WRONLY);
+    if (dummy_fifo < 0) {
+        error_exit("Failed to open dummy FIFO");
     }
-    
-    /* read everithing from the named pipe */
-    char string[BUFSIZE] = { 0 };
-    while (read(fd, string, (BUFSIZE - 1)) > 0) {
-        printf("from FIFO: %s", string);
-        memset(string, '\0', BUFSIZE);
-    }
-    
-    /* close the named pipe */
-    if (close(fd) < 0) {
-        perror("close");
-        exit(EXIT_FAILURE);
-    }
-    printf("BOSS: the named pipe is closed\n");
-    
-    /* remove the named pipe for reading */
-    if (remove(NAMEDPIPE_NAME) < 0) {
-        perror("remove");
-        exit(EXIT_FAILURE);
-    }
-    
+
+	while(1) {
+		
+		// reading from boss FIFO
+		memset(buffer, '\0', BUFSIZE);
+		if (read(boss_fifo, buffer, BUFSIZE) <= 0) { 
+			fprintf(stderr, "BOSS: error while reading from FIFO");
+			continue;
+		}
+		
+		int worker_pid = 0;
+		if (sscanf(buffer, "Done(%d)", &worker_pid) == 1) { // worker is done
+			// here we are supposed to process the data from the worker
+			printf("BOSS: worker(%d) is done.\n", worker_pid);
+			continue;
+		} else if (sscanf(buffer, "Connect(%d)", &worker_pid) == 1) { // worker just connected
+			printf("BOSS: worker(%d) connected.\n", worker_pid);
+			
+			// full path to worker FIFO file
+			char worker_fifo_path[WORKER_FIFO_NAME_LEN]= {0};  
+			snprintf(worker_fifo_path, WORKER_FIFO_NAME_LEN, WORKER_FIFO_TEMPLATE, worker_pid);
+			// open worker FIFO (outgoing)
+			int worker_fifo = open(worker_fifo_path, O_WRONLY);
+			if (worker_fifo < 0) {
+				fprintf(stderr, "Failed to open worker(%d) FIFO", worker_pid);
+				continue;
+			}
+			// send some data to the worker
+			memset(buffer, '\0', BUFSIZE);
+			for (int i = 0; i < (BUFSIZE - 1); i++) {
+				buffer[i] = 48 + (i % 10);
+			}
+			if (write(worker_fifo, buffer, BUFSIZE) < 0) {
+				fprintf(stderr, "Failed to write to worker(%d) FIFO", worker_pid);
+			}
+			// close worker FIFO
+			if (close(worker_fifo) < 0) {
+				fprintf(stderr, "Failed to close worker(%d) FIFO", worker_pid);
+			}
+		} else {
+			fprintf(stderr, "BOSS: unknown message fron a worker: %s\n", buffer);
+			continue;
+		}
+	}
+   
     exit(EXIT_SUCCESS);
 }
 
-/* returns a string which is a random integer from range [min,max] */
-int get_random_range(void)
+/* prints error message and terminates the program */
+void error_exit(char* msg)
 {
-    return ((rand() % (MAX_RANDOM - MIN_RANDOM + 1)) + MIN_RANDOM);
+    fprintf(stderr, "%s: %s\n", msg, strerror(errno));
+    exit(EXIT_FAILURE);
+}
+
+/* signal handler for Ctrl+C */
+void intHandler(int i) {
+    
+	if (close(dummy_fifo) < 0) {
+		error_exit("Failed to close dummy FIFO");
+	} 
+	if (close(boss_fifo) < 0) {
+		error_exit("Failed to close boss FIFO");
+	} 
+	printf("BOSS: all FIFO are closed.\n");
+	
+	// delete FIFO file
+    if (unlink(BOSS_FIFO) < 0) {
+        error_exit("Failed to delete FIFO file");
+    }
+	exit(EXIT_SUCCESS);
 }
