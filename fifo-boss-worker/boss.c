@@ -83,6 +83,7 @@ int main(int argc, char** argv)
                     packet.data[i] = 'A' + i;
                 }
                 packet.data[26] = '\0';
+		packet.code = WORK;
                 if (write(worker_fifo, &packet, sizeof(packet)) < 0) {
                     fprintf(stderr, "Failed to write to worker(%d) FIFO", packet.pid);
                 }
